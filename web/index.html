@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>FoxDot Radio</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/station.js"></script>
+</head>
+<body>
+  <canvas id="visualizer" aria-hidden="true"></canvas>
+  <main class="broadcast">
+    <header>
+      <span class="brand">FOXDOT<span> RADIO</span></span>
+      <span class="status"><i></i><span id="status">TUNING IN</span></span>
+    </header>
+    <section class="track" aria-live="polite">
+      <p class="label">NOW PLAYING</p>
+      <h1 id="title">FoxDot Radio</h1>
+      <p id="details" class="details">Preparing audio</p>
+    </section>
+    <footer>
+      <span id="mode">FOXDOT · SUPERCOLLIDER</span>
+      <div class="progress" aria-hidden="true"><div id="progress"></div></div>
+      <span id="timer">00:00</span>
+    </footer>
+  </main>
+  <button id="play" type="button" hidden>Play preview</button>
+</body>
+</html>
