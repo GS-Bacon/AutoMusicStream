@@ -37,6 +37,45 @@ header, footer {
 body[data-playing="true"] .status { color: var(--accent); }
 body[data-playing="true"] .status i { box-shadow: 0 0 16px currentColor; }
 
+.score-panel {
+  position: absolute;
+  top: 15%;
+  left: clamp(22px, 4.3vw, 100px);
+  width: min(47vw, 880px);
+  padding: 0 0 0 clamp(10px, 1.05vw, 20px);
+  border-left: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  color: #a4aec9;
+  font: clamp(10px, 1vw, 18px)/1.65 "IBM Plex Mono", Consolas, monospace;
+  text-shadow: 0 1px 12px #030410;
+}
+.score-heading {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0 1em;
+  margin-bottom: .65em;
+  color: var(--accent);
+  font-size: .85em;
+  letter-spacing: .08em;
+  font-variant-numeric: tabular-nums;
+}
+#patterns { display: block; font: inherit; white-space: pre-wrap; }
+.pattern-line { display: block; }
+.pattern-name { color: #c5d2f8; }
+.pattern-value { color: #91b8dc; border-radius: .15em; }
+.pattern-value[data-rest] { color: #828ba8; }
+.pattern-name[data-edited], .pattern-value[data-edited] {
+  color: #ffe7a4;
+  text-decoration: underline;
+  text-underline-offset: .25em;
+}
+.pattern-value[data-active] {
+  color: #050c19;
+  background: var(--accent);
+  box-shadow: 0 0 .6em color-mix(in srgb, var(--accent) 65%, transparent);
+  text-shadow: none;
+}
+
 .track {
   align-self: end;
   width: min(56%, 1050px);
@@ -81,6 +120,12 @@ footer { gap: 1.7em; color: #b7bfd8; white-space: nowrap; text-transform: upperc
 }
 
 @media (max-width: 650px) {
+  .score-panel { width: calc(100% - 44px); top: 12%; }
   .track { width: 88%; }
   footer { gap: .85em; letter-spacing: .05em; }
+}
+
+@media (max-height: 500px) {
+  .score-panel { line-height: 1.4; }
+  .track { padding-bottom: 3vmin; }
 }
