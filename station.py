@@ -20,15 +20,22 @@ from urllib.request import Request, urlopen
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from FoxDot import P, Scale
+from FoxDot import P, PGroup, Scale
+
+from arrangement import (
+    CYCLE_LENGTH, LEADS, PRESETS, STYLES, arrangement, ensemble_for, genre_pair,
+    melody_variation, mix,
+)
+from song_form import BARS, REPRISE_BAR, bridge_from_theme, close_voicing, phrase_bars
 
 
 ROOT = Path(__file__).resolve().parent
 RATE = 48000
-BARS = 8
+TAIL = 0.65
 NOTES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 SCALES = ("minor", "dorian", "major", "mixolydian")
-LEADS = ("fm", "pulse", "triangle")
+SYNTHS = ("radioMix", "radioKick", "radioSnare", "radioHat", "radioPerc",
+          "radioBass", "radioPad", "radioLead")
 
 
 def sequence_schema(length, values):
@@ -50,14 +57,23 @@ def rhythm_schema(minimum):
     }
 
 
+MELODY_SLOT_SCHEMA = {
+    "anyOf": [
+        integer_schema(0, 12),
+        {"type": "array", "minItems": 2, "maxItems": 4, "items": integer_schema(-3, 12)},
+        {"type": "null"},
+    ],
+}
 FIELDS = {
     "title": {"type": "string", "minLength": 1, "maxLength": 40},
-    "bpm": integer_schema(78, 114),
+    "bpm": integer_schema(78, 118),
     "root": {"type": "string", "enum": NOTES},
     "scale": {"type": "string", "enum": SCALES},
     "lead": {"type": "string", "enum": LEADS},
     "chords": sequence_schema(4, integer_schema(0, 6)),
-    "melody": sequence_schema(16, note_schema(12)),
+    "melody": sequence_schema(16, MELODY_SLOT_SCHEMA),
+    "bridge": sequence_schema(16, MELODY_SLOT_SCHEMA),
+    "counter": sequence_schema(16, note_schema(7)),
     "bass": sequence_schema(8, note_schema(7)),
     "kick": rhythm_schema(1),
     "hat": rhythm_schema(2),
@@ -87,29 +103,57 @@ def matches(value, schema):
 
 
 def validate(score):
-    if not isinstance(score, dict) or score.keys() != FIELDS.keys():
+    if not isinstance(score, dict):
+        raise ValueError("The score must be an object")
+    if "counter" not in score:
+        score = {**score, "counter": list(STYLES[0].counter)}
+    if "bridge" not in score and matches(score.get("melody"), FIELDS["melody"]):
+        if any(note is not None for note in score["melody"]):
+            score = {**score, "bridge": bridge_from_theme(score["melody"])}
+    if score.keys() != FIELDS.keys():
         raise ValueError("The score has missing or unexpected fields")
     for field, schema in FIELDS.items():
         if not matches(score[field], schema):
             raise ValueError(f"Invalid score field: {field}")
-    if not score["title"].strip() or not any(note is not None for note in score["melody"]):
-        raise ValueError("The score needs a title and a melody")
+    if not score["title"].strip() or not all(
+        any(note is not None for note in score[field]) for field in ("melody", "bridge", "counter")
+    ):
+        raise ValueError("The score needs a title and notes in the theme, bridge and counter")
+    if any(len(score[name]) != len(set(score[name])) for name in ("kick", "hat")):
+        raise ValueError("Drum positions must be distinct")
+    if score["melody"] == score["bridge"]:
+        raise ValueError("The bridge must contrast with the theme")
+    for field in ("melody", "bridge"):
+        for slot in score[field]:
+            if isinstance(slot, list) and (len(slot) != len(set(slot)) or max(slot) - min(slot) > 9):
+                raise ValueError(f"A {field} chord needs distinct notes within nine scale steps")
     return score
 
 
 PATTERN_GUIDE = (
-    "chords are zero-based scale degrees, one for every two bars. "
-    "melody has 16 eighth-note slots across two bars, relative to the chord root. "
+    "lead is the main melody instrument for the whole song. "
+    "chords are four zero-based scale degrees, one per two bars of the main eight-bar progression. "
+    "melody, bridge and counter each have 16 eighth-note slots across two bars, relative to the current chord root. "
+    "A melody slot can be a single degree or a chord of 2 to 4 distinct degrees within 9 steps, "
+    "e.g. [2, 4, 6, 8] for a rootless ninth chord. Keep sax phrases monophonic and leave room for accompaniment. "
+    "counter is an independent lower line played a sixteenth after each slot. "
+    "Use chord tones for the counter when it overlaps a strong lead note and leave room for call and response. "
     "bass has 8 eighth-note slots per bar, relative to the chord root. "
     "Null is a rest. kick and hat are distinct positions on a single 16-step bar. "
 )
+COMPOSER_RULES = (
+    ROOT / "skills" / "foxdot-dynamic-arrangement" / "references" / "composer-rules.md"
+).read_text(encoding="utf-8")
 
 
-def compose_with_ollama(model, url, previous):
+def compose_with_ollama(model, url, previous, style):
+    context = style[0] if style[0] == style[1] else f"{style[0]} to {style[1]}"
     instruction = (
-        "Compose a mellow electronic track in the supplied JSON schema. " + PATTERN_GUIDE +
-        "Aim for a clear motif, a sparse syncopated rhythm and playable harmony. "
-        "Use a new short title. Give only the JSON object. "
+        f"Revise the themes for a 32-bar arrangement in {context}. "
+        + PATTERN_GUIDE + "\n" + COMPOSER_RULES + "\n"
+        "The arranger handles tempo and drums independently. Keep bpm, root, scale and lead exactly as given. "
+        "Develop the theme or bridge to suit the next style. Keep a short motif for continuity. "
+        "Give only JSON. "
         f"Previous track: {json.dumps(previous, ensure_ascii=False)}"
     )
     request = Request(url.rstrip("/") + "/api/chat", method="POST",
@@ -117,7 +161,7 @@ def compose_with_ollama(model, url, previous):
                       data=json.dumps({
                           "model": model, "stream": False, "format": SCORE_SCHEMA,
                           "messages": [{"role": "user", "content": instruction}],
-                          "options": {"temperature": 0.8, "num_predict": 500},
+                          "options": {"temperature": 0.8, "num_predict": 900},
                       }).encode())
     with urlopen(request, timeout=18) as response:
         content = json.load(response)["message"]["content"]
@@ -137,13 +181,17 @@ class CodexComposer:
             "--color", "never", "--output-schema", str(schema), "-",
         ]
 
-    def revise(self, previous, stopped):
+    def revise(self, previous, stopped, style):
+        context = style[0] if style[0] == style[1] else f"{style[0]} to {style[1]}"
         prompt = (
-            "You are live-coding an eight-bar mellow electronic loop. "
+            f"You are live-coding themes for a 32-bar arrangement in {context}. "
             "Use the supplied score as data. Return one complete revised score as JSON. "
-            "Keep the tempo, root and scale. Change one or two parts audibly while "
-            "preserving the groove. Keep unedited parts as-is. Use no tools. "
+            "The arranger blends tempo, sound layers and drum grooves independently. "
+            "Keep bpm, root, scale and lead exactly. Develop the theme or bridge to suit the next style. "
+            "Keep a short motif for continuity. "
+            "Keep unedited parts as-is. Use no tools. "
             + PATTERN_GUIDE
+            + "\n" + COMPOSER_RULES + "\n"
             + f"Score constraints: {json.dumps(SCORE_SCHEMA, ensure_ascii=False)}\n"
             + f"Currently playing: {json.dumps(previous, ensure_ascii=False)}\n"
         )
@@ -172,9 +220,9 @@ class CodexComposer:
                 raise RuntimeError(f"Codex exited with {process.returncode}: {detail}")
 
         score = validate(json.loads(output))
-        if any(score[name] != previous[name] for name in ("bpm", "root", "scale")):
-            raise ValueError("Codex changed the tempo or key")
-        if all(score[name] == previous[name] for name in ("lead", "chords", "melody", "bass", "kick", "hat")):
+        if any(score[name] != previous[name] for name in ("bpm", "root", "scale", "lead")):
+            raise ValueError("Codex changed the tempo, key or lead instrument")
+        if all(score[name] == previous[name] for name in FIELDS if name != "title"):
             raise ValueError("Codex returned the same patterns")
         return score
 
@@ -197,27 +245,34 @@ def find_codex():
     return None
 
 
-def vary(seed, index):
+def vary(seed, index, fixed_style=None):
     rng = random.Random(index)
-    motif = list(seed["melody"])
-    step = rng.choice([i for i, note in enumerate(motif) if note is not None])
-    motif[step] = rng.choice([2, 4, 6, 7, 9])
+    score = dict(seed)
+    if fixed_style is None:
+        score.update(melody_variation(seed, index), lead=ensemble_for(index).lead)
+        if seed.get("bridge") in (None, bridge_from_theme(seed["melody"])):
+            score["bridge"] = bridge_from_theme(score["melody"])
     return {
-        **seed, "title": f"{seed['title']} / {index:02d}",
-        "bpm": seed["bpm"] + rng.randint(-4, 4),
-        "chords": [seed["chords"][0], seed["chords"][1], rng.choice([2, 3, 5, 6]), seed["chords"][3]],
-        "melody": motif, "hat": sorted(set(seed["hat"]) | {rng.choice([3, 9, 15])}),
+        **score,
+        "hat": sorted(set(seed["hat"]) | {rng.choice([3, 9, 15])}) if len(seed["hat"]) < 8 else seed["hat"],
     }
 
 
-def events_for(score, index):
-    beat = 60 / score["bpm"]
+def events_for(score, index, fixed_style=None):
+    bars, length = arrangement(index, score["bpm"], fixed_style)
+    ensemble = ensemble_for(index, fixed_style)
     scale = getattr(Scale, score["scale"])
     root = NOTES.index(score["root"])
     rng = random.Random(index)
-    melody, bass, chords = (P[score[name]] for name in ("melody", "bass", "chords"))
+    if "bridge" not in score:
+        score = {**score, "bridge": bridge_from_theme(score["melody"])}
+    phrases = {field: P[[tuple(slot) if isinstance(slot, list) else slot for slot in score[field]]]
+               for field in ("melody", "bridge")}
+    counter, bass = (P[score[name]] for name in ("counter", "bass"))
+    form = phrase_bars(score, ensemble.form)
     events = []
     cues = []
+    previous_voicing = (2, 4, 6)
 
     def add(time, synth, cue=None, **params):
         onset = time + 0.03
@@ -226,45 +281,161 @@ def events_for(score, index):
             field, slot, duration = cue
             cues.append((round(onset, 4), field, slot, round(duration, 4)))
 
-    for bar in range(BARS):
-        start = bar * beat * 4
-        degree = chords[bar // 2]
-        if bar % 2 == 0:
-            for interval, pan in zip([0, 2, 4, 8], [-0.68, 0.49, -0.26, 0.64]):
+    def lead(time, freq, voice, amp, hold, pan, cue=None, color=1.0):
+        if amp < 0.005:
+            return False
+        add(time, "radioLead", cue, freq=freq, amp=amp, pan=pan, hold=hold,
+            shape=LEADS.index(voice), color=color)
+        return True
+
+    def play_group(time, frequencies, voice, amp, hold, pan, cue=None, color=1.0):
+        if len(frequencies) == 1:
+            lead(time, frequencies[0], voice, amp, hold, pan, cue, color)
+            return
+        roll = 0.014 if voice == "guitar" else 0
+        inner_gain = 0.78 / (len(frequencies) - 1) ** 0.5
+        for part, freq in enumerate(frequencies):
+            top = part == len(frequencies) - 1
+            spread = 0.14 * (2 * part / (len(frequencies) - 1) - 1)
+            if lead(time + roll * part, freq, voice, amp * (0.78 if top else inner_gain),
+                    hold, pan + spread, cue, color):
+                cue = None
+
+    for bar, (feel, part) in enumerate(zip(bars, form)):
+        start, beat = feel.start, feel.beat
+        swing, drums, shade, echo = (feel.blend(field) for field in ("swing", "drums", "shade", "echo"))
+        section = part.section
+        building = section.phrase == "build"
+        breakdown = section.phrase == "bridge" and ensemble.form != "jazz"
+        jazz_bridge_end = ensemble.form == "jazz" and section.phrase == "bridge" and part.position == 7
+        brightness = min(1.0, 0.44 + part.position * 0.18) if building else 1.0
+        drum_level = drums * section.drums * (1.0 + 0.18 * part.position if building else 1.0)
+        first_slot = (bar % 2) * 8
+        melody = phrases[part.field]
+        has_chords = any(isinstance(melody[slot], PGroup) for slot in part.slots)
+        pad_level = mix(0.115, 0.044, shade) * (0.56 if has_chords else 1.0)
+        pad_level *= ensemble.pad_gain * section.pad
+        changes = part.harmony[0] != part.harmony[1]
+        comp = []
+        for half, degree in enumerate(part.harmony if changes else part.harmony[:1]):
+            chord_length = 2 if changes else 4
+            chord_time = start + beat * (half * 2)
+            for interval, pan in zip((0, 2, 4, 6), (-0.62, 0.42, -0.3, 0.58)):
                 freq = scale.get_freq(degree + interval, octave=4, root=root)
-                cue = ("chords", bar // 2, beat * 7) if interval == 0 else None
-                add(start, "radioPad", cue, freq=freq, amp=0.10, pan=pan, hold=beat * 7)
+                chord_slot = part.position // 2
+                cue = None
+                if interval == 0 and degree == score["chords"][chord_slot]:
+                    cue = ("chords", chord_slot, beat * chord_length * 0.9)
+                add(chord_time, "radioPad", cue, freq=freq, amp=pad_level,
+                    pan=pan, hold=beat * (chord_length - 0.9), shade=shade)
+            previous_voicing = close_voicing(degree, 4 if bar % 2 == 0 else 8, previous_voicing)
+            comp.append([scale.get_freq(pitch, octave=4, root=root) for pitch in previous_voicing])
+        if part.cadence:
+            tonic = scale.get_freq(0, octave=5, root=root)
+            lead(start + 0.012, tonic, score["lead"], 0.145, beat * 2.65, -0.14)
 
         for step in range(16):
-            time = start + (step + 0.16 * (step % 2)) * beat / 4
-            if step in score["kick"] and (bar > 0 or step % 4 == 0):
-                add(time, "radioKick", ("kick", score["kick"].index(step), 0.15),
-                    amp=0.36 if step == 0 else 0.25)
-            if step in (4, 12) and bar > 0:
-                add(time, "radioSnare", amp=0.22 if step == 4 else 0.18)
-            if step in score["hat"]:
-                add(time, "radioHat", ("hat", score["hat"].index(step), 0.11),
-                    amp=rng.uniform(0.058, 0.12), pan=rng.uniform(-0.52, 0.52),
-                    hold=0.15 if step % 4 == 2 else 0.065)
-            if step % 2 == 1:
+            offset = swing if step % 4 != 0 else 0
+            time = start + (step + offset) * beat / 4
+            melody_slot = first_slot + step // 2
+            half = step // 8 if changes else 0
+            degree = part.harmony[half]
+            has_lead = melody_slot in part.slots
+            breath = (jazz_bridge_end or (building and part.position == section.bars - 1)) and step >= 12
+            if breath:
                 continue
-            bass_note = bass[step // 2]
-            if isinstance(bass_note, int):
-                freq = scale.get_freq(degree + bass_note, octave=2, root=root)
-                add(time, "radioBass", ("bass", step // 2, beat * 0.39),
-                    freq=freq, amp=0.24, hold=beat * 0.39)
-            melody_slot = (bar % 2) * 8 + step // 2
+            if step in ensemble.comp_steps and (not part.cadence or step < 8):
+                level = (0.080 if has_lead else 0.115) * section.comp
+                play_group(time + 0.012, comp[half], ensemble.comp, level,
+                           beat * ensemble.comp_hold, 0.23, color=0.76)
+            fill_steps = (8, 12, 14) if part.position <= 1 else (9, 11, 13, 14, 15)
+            if part.fill and step in fill_steps:
+                add(time, "radioSnare", amp=drum_level * (0.07 + step * 0.005), shade=shade)
+            for field, synth, weight, amp, cue_length in (
+                ("kick", "radioKick", 0.78, 0.42 if step == 0 else 0.35, 0.15),
+                ("snare", "radioSnare", 1.0, 0.27 if step == 4 else 0.23, 0.12),
+                ("hat", "radioHat", 0.72, rng.uniform(0.09, 0.17), 0.11),
+            ):
+                slots = score.get(field, ())
+                if ((breakdown and field != "hat") or
+                        (part.cadence and (field != "kick" or step != 0))):
+                    continue
+                level = (feel.hit(field, step) * weight + (step in slots) * (1 - weight)) * drum_level * amp
+                if level < 0.012:
+                    continue
+                cue = (field, slots.index(step), cue_length) if step in slots else None
+                params = {"shade": shade, "amp": level}
+                if field == "hat":
+                    params.update(pan=rng.uniform(-0.56, 0.56), hold=0.16 if step % 4 == 2 else 0.058)
+                add(time, synth, cue, **params)
+
+            perc_level = feel.hit("percussion", step) * drum_level if not part.cadence else 0
+            if perc_level > 0.05:
+                add(time, "radioPerc", amp=0.15 * perc_level, voice=ensemble.perc_voice,
+                    pan=rng.uniform(-0.55, 0.55))
+
+            bass_note = bass[step // 2] if step % 2 == 0 else None
+            bass_hit = feel.hit("bass_steps", step)
+            if (isinstance(bass_note, int) or bass_hit > 0.02) and (not part.cadence or step == 0):
+                from_score = isinstance(bass_note, int)
+                if not from_score:
+                    bass_note = 4 if step in (6, 14) else 0
+                freq = scale.get_freq(degree + bass_note, octave=ensemble.bass_octave, root=root)
+                hold = beat * (2.0 if part.cadence else (ensemble.bass_hold or mix(0.43, 0.23, shade)))
+                if part.cadence:
+                    freq = scale.get_freq(0, octave=ensemble.bass_octave, root=root)
+                level = mix(0.64, 1.0, drums) * (0.14 * from_score + 0.11 * bass_hit) * section.bass
+                cue = ("bass", step // 2, hold) if from_score else None
+                if level >= 0.005:
+                    add(time, "radioBass", cue, freq=freq, amp=level, hold=hold, voice=ensemble.bass)
+
+            if step % 2:
+                note = counter[melody_slot]
+                if isinstance(note, int) and not part.cadence:
+                    freq = scale.get_freq(degree + note, octave=4, root=root)
+                    hold = beat * mix(1.32, 0.64, shade)
+                    level = (0.069 if has_lead else 0.127) * section.counter
+                    pan = 0.43 if bar % 2 == 0 else 0.32
+                    cue = ("counter", melody_slot, min(hold, beat * 0.6))
+                    lead(time, freq, ensemble.counter_voice, level, hold, pan, cue)
+                continue
             lead_note = melody[melody_slot]
-            if isinstance(lead_note, int) and (bar not in (0, 6) or step % 4 == 0):
-                freq = scale.get_freq(degree + lead_note, octave=5, root=root)
-                shape = LEADS.index(score["lead"])
-                cue = ("melody", melody_slot, beat * 0.38)
-                add(time + 0.015, "radioLead", cue, freq=freq, amp=0.13, pan=rng.uniform(-0.38, 0.38),
-                    hold=beat * 1.1, shape=shape)
-                if bar in (3, 5, 7) and step < 12:
-                    add(time + beat * 0.75, "radioLead", cue, freq=freq, amp=0.036, pan=0.54,
-                        hold=beat * 0.66, shape=shape)
-    return sorted(events, key=lambda event: event[0]), BARS * 4 * beat + 0.4, sorted(cues)
+            if has_lead and isinstance(lead_note, (int, PGroup)):
+                pitches = sorted(lead_note) if isinstance(lead_note, PGroup) else [lead_note]
+                is_chord = len(pitches) > 1
+                base = degree
+                # Move the whole voicing together so folding the register preserves its intervals.
+                while base + pitches[-1] >= 11:
+                    base -= 7
+                register = part.register
+                if register > 0 and base + pitches[-1] > 5:
+                    register = 0
+                frequencies = [scale.get_freq(base + pitch, octave=5 + register, root=root)
+                               for pitch in pitches]
+                pan = rng.uniform(-0.20, -0.08)
+                accent = 1.0 if step % 4 == 0 else 0.77
+                next_note = next((slot for slot in part.slots if slot > melody_slot), first_slot + 8)
+                hold = beat * min((next_note - melody_slot) * 0.49 + 0.15, mix(1.60, 0.85, shade))
+                if is_chord:
+                    hold = beat * min(feel.blend("chord_hold"), (next_note - melody_slot) * 0.5 + 0.18)
+                    accent = 1.0 if step % 4 == 2 else 0.93
+                hold *= part.space
+                melody_time = time + 0.012 + beat * part.delay
+                voice = score["lead"]
+                cue = (part.field, melody_slot, min(hold, beat * 0.6))
+                amplitude = 0.171 * accent * section.melody
+                play_group(melody_time, frequencies, voice, amplitude, hold, pan, cue, color=brightness)
+                if is_chord and echo > 0.4:
+                    for delay, gain, color, echo_pan in ((0.75, 0.49, 0.25, -pan * 2),
+                                                        (1.50, 0.24, 0.10, pan * 2)):
+                        repeat = melody_time + beat * delay
+                        if repeat < length:
+                            play_group(repeat, frequencies, voice, amplitude * gain * (echo - 0.4) / 0.6,
+                                       min(hold, beat * 0.60), echo_pan, color=color)
+                elif echo > 0.4 and step in (0, 6, 10):
+                    lead(melody_time + beat * 0.75, frequencies[0], voice, 0.039 * echo,
+                         beat * 0.68, -pan * 2, color=0.24)
+    return sorted(events, key=lambda event: event[0]), length + TAIL, sorted(cues)
 
 
 def osc_string(value):
@@ -326,18 +497,21 @@ def run_sc(command, timeout, allowed_exit_codes=(0,)):
 
 
 class Renderer:
-    def __init__(self, directory, work):
+    def __init__(self, directory, work, fixed_style=None):
         sclang, self.scsynth = find_supercollider(directory)
         self.work = work
+        self.fixed_style = fixed_style
         script = work / "synths.scd"
         shutil.copyfile(ROOT / script.name, script)
         run_sc([sclang, "-D", "-u", "0", str(script), str(work)], timeout=25)
-        self.definitions = [path.read_bytes() for path in sorted(work.glob("*.scsyndef"))]
-        if len(self.definitions) != 7:
-            raise RuntimeError("SuperCollider failed to compile all instruments.")
+        files = [work / f"{name}.scsyndef" for name in SYNTHS]
+        missing = [file.stem for file in files if not file.is_file()]
+        if missing:
+            raise RuntimeError(f"SuperCollider could not compile: {', '.join(missing)}")
+        self.definitions = [file.read_bytes() for file in files]
 
     def render(self, score, index):
-        events, duration, cues = events_for(score, index)
+        events, duration, cues = events_for(score, index, self.fixed_style)
         osc_path = self.work / "score.osc"
         wav_path = self.work / "track.wav"
         wav_path.unlink(missing_ok=True)
@@ -353,7 +527,7 @@ class Renderer:
         exit_codes = (0, 0xC0000005) if os.name == "nt" else (0,)
         log = run_sc([self.scsynth, "-o", "2", "-i", "0", "-m", "32768", "-N",
                       str(osc_path), "_", str(wav_path), str(RATE), "WAV", "int16"],
-                     timeout=20, allowed_exit_codes=exit_codes)
+                     timeout=40, allowed_exit_codes=exit_codes)
         failures = [line for line in log.splitlines() if "FAILURE" in line or "not found" in line]
         if failures:
             raise RuntimeError("\n".join(dict.fromkeys(failures))[:2000])
@@ -370,9 +544,11 @@ class Renderer:
 
 
 class Station:
-    def __init__(self, renderer, seeds, model, url, codex=None):
-        self.renderer, self.seeds, self.model, self.url = renderer, seeds, model, url
+    def __init__(self, renderer, seeds, model, url, codex=None, fixed_style=None):
+        self.renderer, self.model, self.url = renderer, model, url
+        self.seeds = [validate(score) for score in seeds]
         self.codex = codex
+        self.fixed_style = fixed_style
         self.codex_status = "waiting" if codex else ""
         self.condition = Condition()
         self.tracks = {}
@@ -380,96 +556,129 @@ class Station:
         self.stopped = Event()
         self.playing = 0
         self.last_played = 0
-        self.worker = Thread(target=self.generate, name="composition", daemon=True)
+        self.pending_revision = None
+        self.worker = Thread(target=self.generate, name="arrangement", daemon=True)
         self.worker.start()
+        self.composer_worker = None
+        if self.codex or self.model:
+            self.composer_worker = Thread(target=self.compose, name="composition", daemon=True)
+            self.composer_worker.start()
 
     def close(self):
         with self.condition:
             self.stopped.set()
             self.condition.notify_all()
         self.worker.join()
+        if self.composer_worker:
+            self.composer_worker.join()
 
-    def can_generate(self, index, next_attempt):
-        if not self.codex:
-            return index <= self.target
-        now = monotonic()
-        return index == 1 or (self.playing == index - 1 and now - self.last_played < 5 and now >= next_attempt)
-
-    def generate(self):
-        index = 1
-        previous = self.seeds[0]
+    def compose(self):
+        # AI can take longer than a section. Render and play the genre cycle independently.
+        requested = 0 if self.codex else 1
         next_attempt = 0
         while True:
             with self.condition:
-                self.condition.wait_for(lambda: self.stopped.is_set() or self.can_generate(index, next_attempt))
+                self.condition.wait_for(lambda: self.stopped.is_set() or (
+                    self.playing > requested and self.playing in self.tracks
+                    and monotonic() >= next_attempt and monotonic() - self.last_played < 5
+                ))
                 if self.stopped.is_set():
                     return
-            seed = self.seeds[(index - 1) % len(self.seeds)]
-            score = seed if index <= len(self.seeds) else vary(seed, index)
-            mode = "Codex score" if index <= len(self.seeds) else "Pattern variation"
-            if self.codex and index > 1:
-                self.codex_status = "composing"
-                next_attempt = monotonic() + self.codex.interval
-                logging.info("Codex is revising %s", previous["title"])
-                try:
-                    score = self.codex.revise(previous, self.stopped)
-                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-                    self.codex_status = "retry"
-                    next_attempt = max(next_attempt, monotonic() + self.codex.interval)
-                    logging.warning("Keeping the current loop: %s", error)
-                    continue
-                if self.stopped.is_set():
-                    return
-                self.codex_status = "rendering"
-                mode = "Codex live"
-            elif self.model and index > 2:
-                try:
-                    score = compose_with_ollama(self.model, self.url, previous)
+                requested = self.playing
+                previous = self.tracks[requested][0]["score"]
+                left, right, _ = genre_pair(next(reversed(self.tracks)) + 1, self.fixed_style)
+                if self.codex:
+                    self.codex_status = "composing"
+            style = left.name, right.name
+            try:
+                if self.codex:
+                    next_attempt = monotonic() + self.codex.interval
+                    logging.info("Codex is revising %s", previous["title"])
+                    score = self.codex.revise(previous, self.stopped, style)
+                    mode = "Codex live"
+                else:
+                    score = compose_with_ollama(self.model, self.url, previous, style)
+                    score = {**score, **{field: previous[field] for field in ("bpm", "root", "scale", "lead")}}
                     mode = "Ollama"
-                except (OSError, URLError, ValueError, KeyError, TypeError) as error:
-                    logging.warning("Ollama unavailable, using a local score: %s", error)
+            except (OSError, URLError, ValueError, KeyError, TypeError, RuntimeError,
+                    subprocess.SubprocessError) as error:
+                if self.codex:
+                    self.codex_status = "retry"
+                logging.warning("Using the available score: %s", error)
+                continue
+            if self.stopped.is_set():
+                return
+            with self.condition:
+                self.pending_revision = score, mode
+                if self.codex:
+                    self.codex_status = "ready"
+
+    def generate(self):
+        index = 1
+        revision = None
+        revision_index = 0
+        while True:
+            with self.condition:
+                self.condition.wait_for(lambda: self.stopped.is_set() or index <= self.target)
+                if self.stopped.is_set():
+                    return
+                if self.pending_revision:
+                    revision = self.pending_revision
+                    revision_index = index
+                    self.pending_revision = None
+                    if self.codex_status == "ready":
+                        self.codex_status = "rendering"
+            if revision:
+                score, mode = revision
+                if index != revision_index:
+                    score = vary(score, index, self.fixed_style)
+                elif self.fixed_style is None:
+                    score = {**score, "lead": ensemble_for(index).lead}
+            else:
+                cycle = max(0, index - 2) // CYCLE_LENGTH
+                seed = self.seeds[cycle % len(self.seeds)]
+                score = seed if index == 1 else vary(seed, index, self.fixed_style)
+                score = {**score, **{field: self.seeds[0][field] for field in ("bpm", "root", "scale")}}
+                mode = "Codex score" if index == 1 else "Pattern variation"
             try:
                 data, cues = self.renderer.render(score, index)
             except (OSError, EOFError, wave.Error, RuntimeError, subprocess.SubprocessError) as error:
                 logging.error("Render failed for track %s: %s", index, error)
-                if self.codex and index > 1:
-                    self.codex_status = "retry"
-                    next_attempt = max(next_attempt, monotonic() + self.codex.interval)
                 with self.condition:
                     self.condition.wait_for(self.stopped.is_set, timeout=3)
                 continue
+            bars, length = arrangement(index, score["bpm"], self.fixed_style)
+            form = phrase_bars(score, ensemble_for(index, self.fixed_style).form)
             metadata = {
-                "id": index, "title": score["title"], "bpm": score["bpm"],
+                "id": index, "title": score["title"], "bpm": round(bars[0].bpm),
                 "key": f"{score['root']} {score['scale']}", "mode": mode, "url": f"/audio/{index}.wav",
                 "score": score, "cues": cues, "bars": BARS,
+                "barInfo": [
+                    {"start": bar.start, "bpm": bar.bpm, "genre": bar.label(), "section": part.section.name,
+                     "harmony": part.harmony}
+                    for bar, part in zip(bars, form)
+                ],
+                "musicSeconds": length, "repriseBar": REPRISE_BAR,
             }
-            if self.codex:
-                metadata["loopSeconds"] = BARS * 4 * 60 / score["bpm"]
             with self.condition:
                 self.tracks[index] = metadata, data
                 while len(self.tracks) > 6:
                     del self.tracks[next(iter(self.tracks))]
-                if self.codex and index > 1:
-                    self.codex_status = "ready"
+                if self.codex_status == "rendering":
+                    self.codex_status = "waiting"
             logging.info("Rendered %02d · %s · %s", index, score["title"], mode)
-            previous = score
             index += 1
 
     def next_track(self, after, playing=0):
         with self.condition:
             latest = next(reversed(self.tracks), 0)
-            if self.codex:
-                if latest and playing == latest:
-                    if self.playing != latest:
-                        self.codex_status = "waiting"
-                    self.playing = latest
-                    self.last_played = monotonic()
-                    self.condition.notify()
-                return self.tracks[latest][0] if latest and after != latest else None
+            if playing in self.tracks and playing >= self.playing:
+                self.playing = playing
+                self.last_played = monotonic()
             if after > latest:
                 after = 0
             self.target = max(self.target, after + 2)
-            self.condition.notify()
+            self.condition.notify_all()
             return next((metadata for index, (metadata, _) in self.tracks.items() if index > after), None)
 
     def audio(self, index):
@@ -535,6 +744,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=18765)
     parser.add_argument("--supercollider-dir", type=Path)
+    parser.add_argument("--style", choices=PRESETS, help="play a single genre instead of the radio rotation")
     parser.add_argument("--ollama-model", default=os.getenv("OLLAMA_MODEL"))
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
     parser.add_argument("--codex", action="store_true", help="revise the playing loop with Codex CLI")
@@ -546,10 +756,19 @@ def main():
         parser.error("--codex-interval must be at least 1 second")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         datefmt="%H:%M:%S", force=True)
-    seeds = [validate(score) for score in json.loads((ROOT / "scores.json").read_text(encoding="utf-8"))]
+    fixed_style = None
+    if args.style:
+        fixed_style, score = PRESETS[args.style]
+        seeds = [validate({
+            **score, "bpm": fixed_style.bpm, "lead": fixed_style.lead,
+            "melody": [list(note) if isinstance(note, tuple) else note for note in fixed_style.melody],
+            "counter": list(fixed_style.counter), "kick": list(fixed_style.kick), "hat": list(fixed_style.hat),
+        })]
+    else:
+        seeds = [validate(score) for score in json.loads((ROOT / "scores.json").read_text(encoding="utf-8"))]
     try:
         with tempfile.TemporaryDirectory(prefix="foxdot-radio-") as work:
-            renderer = Renderer(args.supercollider_dir, Path(work))
+            renderer = Renderer(args.supercollider_dir, Path(work), fixed_style)
             if args.render:
                 data, _ = renderer.render(seeds[0], 1)
                 args.render.write_bytes(data)
@@ -558,10 +777,11 @@ def main():
             if args.codex:
                 command = find_codex()
                 if not command:
-                    raise ValueError("Codex CLI was not found. Install it, add it to PATH and run codex login.")
-                codex = CodexComposer(command, Path(work) / "codex", args.codex_interval)
+                    logging.warning("Codex CLI was not found; using automatic local scores.")
+                else:
+                    codex = CodexComposer(command, Path(work) / "codex", args.codex_interval)
             with ThreadingHTTPServer(("127.0.0.1", args.port), Handler) as server:
-                server.station = Station(renderer, seeds, args.ollama_model, args.ollama_url, codex)
+                server.station = Station(renderer, seeds, args.ollama_model, args.ollama_url, codex, fixed_style)
                 logging.info("OBS source: http://127.0.0.1:%s/?obs=1", args.port)
                 try:
                     server.serve_forever()

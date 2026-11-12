@@ -16,7 +16,6 @@ const output = audio.createGain();
 output.gain.value = 0.84;
 output.connect(analyser).connect(audio.destination);
 const visualizer = createVisualizer(elements.visualizer, analyser);
-const fade = 1.35;
 let current;
 let scheduled;
 let ready;
@@ -32,12 +31,17 @@ const composerLabels = {
   composing: "CODEX · REVISING SCORE",
   rendering: "CODEX · RENDERING AUDIO",
   ready: "CODEX · REVISION QUEUED",
-  retry: "CODEX · LOOPING / WILL RETRY",
+  retry: "CODEX · AUTO PLAY / WILL RETRY",
 };
 
 function setStatus(text, playing) {
   elements.status.textContent = text;
   document.body.dataset.playing = String(playing);
+}
+
+function formatSlot(slot) {
+  if (slot === null) return "None";
+  return Array.isArray(slot) ? `(${slot.join(", ")})` : JSON.stringify(slot);
 }
 
 function showPatterns(score) {
@@ -46,7 +50,8 @@ function showPatterns(score) {
   shownScore = score;
   patternTokens = {};
   elements.patterns.replaceChildren();
-  for (const field of ["lead", "chords", "melody", "bass", "kick", "hat"]) {
+  for (const field of ["lead", "chords", "melody", "bridge", "counter", "bass", "kick", "hat"]) {
+    if (!(field in score)) continue;
     const line = document.createElement("span");
     line.className = "pattern-line";
     const name = document.createElement("span");
@@ -55,16 +60,16 @@ function showPatterns(score) {
     const value = score[field];
     const old = previous?.[field];
     const array = Array.isArray(value);
-    if (previous && array && old.length !== value.length) name.dataset.edited = "";
+    if (previous && array && old?.length !== value.length) name.dataset.edited = "";
     line.append(name, array ? (["kick", "hat"].includes(field) ? " = [" : " = P[") : " = ");
     const slots = array ? value : [value];
     patternTokens[field] = slots.map((slot, i) => {
-      if (i) line.append(field === "melody" && i === 8 ? ",\n           " : ", ");
+      if (i) line.append(["melody", "bridge", "counter"].includes(field) && i === 8 ? ",\n           " : ", ");
       const token = document.createElement("span");
       token.className = "pattern-value";
-      token.textContent = slot === null ? "None" : JSON.stringify(slot);
+      token.textContent = formatSlot(slot);
       if (slot === null) token.dataset.rest = "";
-      if (previous && slot !== (array ? old[i] : old)) token.dataset.edited = "";
+      if (previous && token.textContent !== formatSlot(array ? old?.[i] : old)) token.dataset.edited = "";
       line.append(token);
       return token;
     });
@@ -75,14 +80,20 @@ function showPatterns(score) {
 }
 
 function paintPatterns(elapsed, meta) {
-  const step = Math.floor((elapsed - 0.03) * meta.bpm / 15);
-  const position = step < 0 || step >= meta.bars * 16
-    ? "" : `BAR ${Math.floor(step / 16) + 1}/${meta.bars} · STEP ${step % 16 + 1}/16`;
+  let bar = meta.barInfo.length - 1;
+  while (bar > 0 && meta.barInfo[bar].start > elapsed) bar--;
+  const { start, bpm, genre, section } = meta.barInfo[bar];
+  const step = Math.floor((elapsed - start - 0.03) * bpm / 15);
+  const position = [section, `BAR ${bar + 1}/${meta.bars}`,
+    `STEP ${Math.min(15, Math.max(0, step)) + 1}/16`].filter(Boolean).join(" · ");
   if (elements.playhead.textContent !== position) elements.playhead.textContent = position;
+  const details = `${Math.round(bpm)} BPM  /  ${meta.key}  /  ${genre}`;
+  if (elements.details.textContent !== details) elements.details.textContent = details;
   while (nextCue < meta.cues.length && meta.cues[nextCue][0] <= elapsed) {
     const [time, field, slot, length] = meta.cues[nextCue++];
     if (time + length > elapsed) {
-      const token = patternTokens[field][slot];
+      const token = patternTokens[field]?.[slot];
+      if (!token) continue;
       token.dataset.active = "";
       activeTokens.set(token, time + length);
     }
@@ -100,9 +111,8 @@ function paintPatterns(elapsed, meta) {
 }
 
 function show(track) {
-  const { id, title, bpm, key, mode } = track.meta;
+  const { id, title, mode } = track.meta;
   elements.title.textContent = title;
-  elements.details.textContent = `${bpm} BPM  /  ${key}`;
   elements.mode.textContent = `${mode} · FOXDOT`;
   document.body.dataset.track = String(id);
   visualizer.setTrack(id);
@@ -124,7 +134,7 @@ async function fetchNext(after) {
     if (elements["composer-status"].textContent !== phase) elements["composer-status"].textContent = phase;
     const meta = await response.json();
     if (!meta) return;
-    const file = await fetch(meta.url, { signal });
+    const file = await fetch(meta.url, { signal: AbortSignal.timeout(15000) });
     if (!file.ok) throw new Error("Audio unavailable");
     ready = { meta, buffer: await audio.decodeAudioData(await file.arrayBuffer()) };
   } catch (error) {
@@ -138,24 +148,24 @@ async function fetchNext(after) {
   }
 }
 
-function startTrack(track, start) {
+function startTrack(track, start, reprise = false) {
   const source = audio.createBufferSource();
   const envelope = audio.createGain();
-  const end = start + track.buffer.duration;
-  const fadeIn = track.meta.loopSeconds ? 0.12 : fade;
-  const transition = track.meta.loopSeconds ? start + track.meta.loopSeconds : end - fade;
+  const offset = reprise ? track.meta.barInfo[track.meta.repriseBar].start : 0;
+  const end = start + track.buffer.duration - offset;
+  const transition = start + track.meta.musicSeconds - offset;
   source.buffer = track.buffer;
   source.connect(envelope).connect(output);
   envelope.gain.setValueAtTime(0, start);
-  envelope.gain.linearRampToValueAtTime(1, start + fadeIn);
+  envelope.gain.linearRampToValueAtTime(1, start + 0.035);
   envelope.gain.setValueAtTime(1, transition);
   envelope.gain.linearRampToValueAtTime(0, end);
-  source.start(start);
+  source.start(start, offset);
   source.addEventListener("ended", () => {
     source.disconnect();
     envelope.disconnect();
   }, { once: true });
-  return { ...track, start, transition };
+  return { ...track, start, offset, transition };
 }
 
 function pump() {
@@ -175,12 +185,12 @@ function pump() {
     const { transition } = current;
     const upcoming = transition - now;
     if ((ready && upcoming < 2.25) || upcoming < 0.65) {
-      scheduled = startTrack(ready ?? current, Math.max(now + 0.04, transition));
+      scheduled = startTrack(ready ?? current, Math.max(now + 0.04, transition), !ready);
       ready = undefined;
     }
   }
-  if (!ready && !fetching && performance.now() >= retryAt) {
-    void fetchNext(scheduled?.meta.id ?? current?.meta.id ?? 0);
+  if (!ready && !scheduled && !fetching && (!current || now >= current.start) && performance.now() >= retryAt) {
+    void fetchNext(current?.meta.id ?? 0);
   }
 }
 
@@ -209,8 +219,9 @@ function paint(time) {
 
   if (current) {
     const elapsed = Math.max(0, audio.currentTime - current.start);
-    paintPatterns(elapsed, current.meta);
-    elements.progress.style.transform = `scaleX(${Math.min(1, elapsed / current.buffer.duration)})`;
+    paintPatterns(elapsed + current.offset, current.meta);
+    const length = current.meta.musicSeconds - current.offset;
+    elements.progress.style.transform = `scaleX(${Math.min(1, elapsed / length)})`;
     const seconds = Math.floor(elapsed);
     const pad = (value) => String(value).padStart(2, "0");
     const timer = `${pad(Math.floor(seconds / 60))}:${pad(seconds % 60)}`;
